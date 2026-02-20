@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tetris_players (
     updated_at TIMESTAMP WITH TIME ZONE
 );
 
+
 -- 2. 插入左侧玩家
 INSERT INTO tetris_players (position, player_name, high_score, total_lines_cleared)
 VALUES ('left', '左侧玩家', 0, 0)

@@ -65,6 +65,8 @@ create table if not exists public.matches (
   winner_user_id uuid references auth.users(id) on delete set null,
   disconnect_user_id uuid references auth.users(id) on delete set null,
   disconnect_deadline timestamptz,
+  host_last_seen_at timestamptz,
+  guest_last_seen_at timestamptz,
   end_reason text
     check (end_reason in ('normal', 'disconnect_timeout', 'forfeit', 'abort')),
   started_at timestamptz,
@@ -74,6 +76,12 @@ create table if not exists public.matches (
   constraint matches_host_guest_distinct
     check (guest_user_id is null or host_user_id <> guest_user_id)
 );
+
+alter table public.matches
+  add column if not exists host_last_seen_at timestamptz;
+
+alter table public.matches
+  add column if not exists guest_last_seen_at timestamptz;
 
 create table if not exists public.match_snapshots (
   id bigserial primary key,
@@ -217,12 +225,13 @@ begin
     raise exception 'AUTH_REQUIRED';
   end if;
 
-  insert into public.matches (room_code, status, host_user_id, seed)
+  insert into public.matches (room_code, status, host_user_id, seed, host_last_seen_at)
   values (
     public.generate_room_code(),
     'waiting',
     auth.uid(),
-    coalesce(p_seed, trunc(random() * 9000000000000000000)::bigint)
+    coalesce(p_seed, trunc(random() * 9000000000000000000)::bigint),
+    now()
   )
   returning * into v_match;
 
@@ -245,6 +254,7 @@ begin
 
   update public.matches m
   set guest_user_id = auth.uid(),
+      guest_last_seen_at = now(),
       updated_at = now()
   where m.room_code = upper(trim(p_room_code))
     and m.status = 'waiting'
@@ -295,6 +305,38 @@ begin
        and (case when auth.uid() = m.guest_user_id then p_is_ready else m.guest_ready end) = true
       then coalesce(m.started_at, now())
       else m.started_at
+    end,
+    host_last_seen_at = case
+      when m.status = 'waiting'
+       and m.guest_user_id is not null
+       and (case when auth.uid() = m.host_user_id then p_is_ready else m.host_ready end) = true
+       and (case when auth.uid() = m.guest_user_id then p_is_ready else m.guest_ready end) = true
+      then now()
+      else m.host_last_seen_at
+    end,
+    guest_last_seen_at = case
+      when m.status = 'waiting'
+       and m.guest_user_id is not null
+       and (case when auth.uid() = m.host_user_id then p_is_ready else m.host_ready end) = true
+       and (case when auth.uid() = m.guest_user_id then p_is_ready else m.guest_ready end) = true
+      then now()
+      else m.guest_last_seen_at
+    end,
+    disconnect_user_id = case
+      when m.status = 'waiting'
+       and m.guest_user_id is not null
+       and (case when auth.uid() = m.host_user_id then p_is_ready else m.host_ready end) = true
+       and (case when auth.uid() = m.guest_user_id then p_is_ready else m.guest_ready end) = true
+      then null
+      else m.disconnect_user_id
+    end,
+    disconnect_deadline = case
+      when m.status = 'waiting'
+       and m.guest_user_id is not null
+       and (case when auth.uid() = m.host_user_id then p_is_ready else m.host_ready end) = true
+       and (case when auth.uid() = m.guest_user_id then p_is_ready else m.guest_ready end) = true
+      then null
+      else m.disconnect_deadline
     end,
     updated_at = now()
   where m.id = p_match_id
@@ -369,6 +411,177 @@ begin
 
   if v_match.id is null then
     raise exception 'MATCH_NOT_FOUND_OR_FORBIDDEN';
+  end if;
+
+  return v_match;
+end;
+$$;
+
+create or replace function public.heartbeat_match(
+  p_match_id uuid
+)
+returns public.matches
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_match public.matches;
+  v_now timestamptz := now();
+  v_opponent_id uuid;
+  v_opponent_seen_at timestamptz;
+  v_missing_threshold interval := interval '20 seconds';
+  v_grace interval := interval '45 seconds';
+begin
+  if auth.uid() is null then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+
+  select *
+  into v_match
+  from public.matches
+  where id = p_match_id
+  for update;
+
+  if v_match.id is null then
+    raise exception 'MATCH_NOT_FOUND';
+  end if;
+
+  if auth.uid() <> v_match.host_user_id and auth.uid() <> v_match.guest_user_id then
+    raise exception 'NOT_MATCH_PARTICIPANT';
+  end if;
+
+  update public.matches m
+  set host_last_seen_at = case when auth.uid() = m.host_user_id then v_now else m.host_last_seen_at end,
+      guest_last_seen_at = case when auth.uid() = m.guest_user_id then v_now else m.guest_last_seen_at end,
+      updated_at = now()
+  where m.id = p_match_id
+  returning * into v_match;
+
+  if v_match.status <> 'playing' or v_match.guest_user_id is null then
+    return v_match;
+  end if;
+
+  if auth.uid() = v_match.host_user_id then
+    v_opponent_id := v_match.guest_user_id;
+    v_opponent_seen_at := v_match.guest_last_seen_at;
+  else
+    v_opponent_id := v_match.host_user_id;
+    v_opponent_seen_at := v_match.host_last_seen_at;
+  end if;
+
+  -- First-round guard: wait until both sides reported at least one heartbeat.
+  if v_match.host_last_seen_at is null or v_match.guest_last_seen_at is null then
+    if v_match.disconnect_user_id is not null then
+      update public.matches
+      set disconnect_user_id = null,
+          disconnect_deadline = null,
+          updated_at = now()
+      where id = p_match_id
+      returning * into v_match;
+    end if;
+    return v_match;
+  end if;
+
+  if v_opponent_seen_at is null or (v_now - v_opponent_seen_at) > v_missing_threshold then
+    if v_match.disconnect_user_id is distinct from v_opponent_id then
+      update public.matches
+      set disconnect_user_id = v_opponent_id,
+          disconnect_deadline = v_now + v_grace,
+          updated_at = now()
+      where id = p_match_id
+      returning * into v_match;
+    elsif v_match.disconnect_deadline is null then
+      update public.matches
+      set disconnect_deadline = v_now + v_grace,
+          updated_at = now()
+      where id = p_match_id
+      returning * into v_match;
+    end if;
+  elsif v_match.disconnect_user_id is not null then
+    update public.matches
+    set disconnect_user_id = null,
+        disconnect_deadline = null,
+        updated_at = now()
+    where id = p_match_id
+    returning * into v_match;
+  end if;
+
+  return v_match;
+end;
+$$;
+
+create or replace function public.check_match_timeout(
+  p_match_id uuid
+)
+returns public.matches
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_match public.matches;
+  v_now timestamptz := now();
+  v_missing_threshold interval := interval '20 seconds';
+  v_disconnected_seen_at timestamptz;
+  v_winner_user_id uuid;
+begin
+  if auth.uid() is null then
+    raise exception 'AUTH_REQUIRED';
+  end if;
+
+  select *
+  into v_match
+  from public.matches
+  where id = p_match_id
+  for update;
+
+  if v_match.id is null then
+    raise exception 'MATCH_NOT_FOUND';
+  end if;
+
+  if auth.uid() <> v_match.host_user_id and auth.uid() <> v_match.guest_user_id then
+    raise exception 'NOT_MATCH_PARTICIPANT';
+  end if;
+
+  if v_match.status <> 'playing' or v_match.guest_user_id is null then
+    return v_match;
+  end if;
+
+  if v_match.host_last_seen_at is null or v_match.guest_last_seen_at is null then
+    return v_match;
+  end if;
+
+  if v_match.disconnect_user_id is null then
+    return v_match;
+  end if;
+
+  v_disconnected_seen_at := case
+    when v_match.disconnect_user_id = v_match.host_user_id then v_match.host_last_seen_at
+    when v_match.disconnect_user_id = v_match.guest_user_id then v_match.guest_last_seen_at
+    else null
+  end;
+
+  if v_disconnected_seen_at is not null and (v_now - v_disconnected_seen_at) <= v_missing_threshold then
+    update public.matches
+    set disconnect_user_id = null,
+        disconnect_deadline = null,
+        updated_at = now()
+    where id = p_match_id
+    returning * into v_match;
+    return v_match;
+  end if;
+
+  if v_match.disconnect_deadline is not null and v_now >= v_match.disconnect_deadline then
+    v_winner_user_id := case
+      when v_match.disconnect_user_id = v_match.host_user_id then v_match.guest_user_id
+      when v_match.disconnect_user_id = v_match.guest_user_id then v_match.host_user_id
+      else null
+    end;
+
+    if v_winner_user_id is not null then
+      return public.finish_match(p_match_id, v_winner_user_id, 'disconnect_timeout');
+    end if;
   end if;
 
   return v_match;
@@ -715,6 +928,8 @@ grant execute on function public.join_match_room(text) to authenticated;
 grant execute on function public.set_match_ready(uuid, boolean) to authenticated;
 grant execute on function public.set_disconnect_deadline(uuid, uuid, timestamptz) to authenticated;
 grant execute on function public.clear_disconnect_deadline(uuid) to authenticated;
+grant execute on function public.heartbeat_match(uuid) to authenticated;
+grant execute on function public.check_match_timeout(uuid) to authenticated;
 grant execute on function public.finish_match(uuid, uuid, text) to authenticated;
 grant execute on function public.submit_single_score(integer, integer) to authenticated;
 grant execute on function public.submit_single_ai_result(boolean) to authenticated;

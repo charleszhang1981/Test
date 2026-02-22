@@ -44,6 +44,8 @@ export interface MatchRow {
   winner_user_id: string | null;
   disconnect_user_id: string | null;
   disconnect_deadline: string | null;
+  host_last_seen_at: string | null;
+  guest_last_seen_at: string | null;
   end_reason: 'normal' | 'disconnect_timeout' | 'forfeit' | 'abort' | null;
   started_at: string | null;
   ended_at: string | null;
@@ -292,6 +294,20 @@ export const clearDisconnectDeadline = async (
   matchId: string,
 ): Promise<MatchRow> => {
   const { data, error } = await client().rpc('clear_disconnect_deadline', {
+    p_match_id: matchId,
+  });
+  return unwrap(data as MatchRow | null, error);
+};
+
+export const heartbeatMatch = async (matchId: string): Promise<MatchRow> => {
+  const { data, error } = await client().rpc('heartbeat_match', {
+    p_match_id: matchId,
+  });
+  return unwrap(data as MatchRow | null, error);
+};
+
+export const checkMatchTimeout = async (matchId: string): Promise<MatchRow> => {
+  const { data, error } = await client().rpc('check_match_timeout', {
     p_match_id: matchId,
   });
   return unwrap(data as MatchRow | null, error);

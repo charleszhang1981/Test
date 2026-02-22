@@ -30,7 +30,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
-  clearDisconnectDeadline,
+  checkMatchTimeout,
   createMatchChannel,
   createMatchRoom,
   ensureAnonymousSession,
@@ -39,12 +39,12 @@ import {
   fetchMyProfile,
   fetchMyPlayerStats,
   finishMatch,
+  heartbeatMatch,
   insertSnapshot,
   joinMatchRoom,
   markProfileRegistered,
   onAuthStateChange,
   registerOrUpgrade,
-  setDisconnectDeadline,
   setMatchReady,
   signInWithPassword,
   signOutAndReturnAnonymous,
@@ -400,8 +400,7 @@ const hasMatchMeaningfulChange = (prev: MatchRow, next: MatchRow): boolean => {
     prev.winner_user_id !== next.winner_user_id ||
     prev.disconnect_user_id !== next.disconnect_user_id ||
     prev.disconnect_deadline !== next.disconnect_deadline ||
-    prev.end_reason !== next.end_reason ||
-    prev.updated_at !== next.updated_at
+    prev.end_reason !== next.end_reason
   );
 };
 
@@ -1847,87 +1846,114 @@ function OnlineMode({
     }
 
     let running = true;
-    let pendingDisconnectUpdate = false;
+    let pendingHeartbeat = false;
+
+    const pushHeartbeat = async () => {
+      if (!running || pendingHeartbeat) {
+        return;
+      }
+      pendingHeartbeat = true;
+      try {
+        await broadcast('heartbeat', {
+          matchId: match.id,
+          playerId: userId,
+          ts: Date.now(),
+        } satisfies HeartbeatEvent as unknown as Record<string, unknown>);
+
+        const updated = await heartbeatMatch(match.id);
+        const current = matchRef.current;
+        if (running && (!current || hasMatchMeaningfulChange(current, updated))) {
+          setMatch(updated);
+        }
+      } catch (error) {
+        if (running) {
+          setStatusText(
+            `心跳同步失败：${error instanceof Error ? error.message : 'unknown error'}`,
+          );
+        }
+      } finally {
+        pendingHeartbeat = false;
+      }
+    };
 
     const heartbeatTimer = window.setInterval(() => {
-      void broadcast('heartbeat', {
-        matchId: match.id,
-        playerId: userId,
-        ts: Date.now(),
-      } satisfies HeartbeatEvent as unknown as Record<string, unknown>);
+      void pushHeartbeat();
     }, 5_000);
 
-    const watchdogTimer = window.setInterval(() => {
-      void (async () => {
-        if (!running || pendingDisconnectUpdate) {
-          return;
-        }
-
-        const currentMatch = matchRef.current;
-        const currentOpponentId = opponentIdRef.current;
-        if (!currentMatch || currentMatch.status !== 'playing') {
-          return;
-        }
-        if (!currentOpponentId) {
-          return;
-        }
-
-        const now = Date.now();
-        const missingFor = now - opponentHeartbeatRef.current;
-        const deadline = currentMatch.disconnect_deadline
-          ? new Date(currentMatch.disconnect_deadline).getTime()
-          : null;
-
-        try {
-          if (
-            missingFor > 12_000 &&
-            currentMatch.disconnect_user_id !== currentOpponentId
-          ) {
-            pendingDisconnectUpdate = true;
-            const updated = await setDisconnectDeadline(
-              currentMatch.id,
-              currentOpponentId,
-              new Date(now + 30_000).toISOString(),
-            );
-            setMatch(updated);
-            setStatusText('对手疑似断线，已进入 30 秒重连窗口');
-          }
-
-          if (
-            currentMatch.disconnect_user_id === currentOpponentId &&
-            deadline &&
-            now > deadline &&
-            !endingRef.current
-          ) {
-            await settleMatchIfNeeded(currentOpponentId, 'disconnect_timeout');
-          }
-
-          if (
-            missingFor <= 12_000 &&
-            currentMatch.disconnect_user_id === currentOpponentId &&
-            !endingRef.current
-          ) {
-            pendingDisconnectUpdate = true;
-            const updated = await clearDisconnectDeadline(currentMatch.id);
-            setMatch(updated);
-            setStatusText('对手已重连，比赛继续');
-          }
-        } catch (error) {
-          setStatusText(
-            `断线检测失败：${error instanceof Error ? error.message : 'unknown error'}`,
-          );
-        } finally {
-          pendingDisconnectUpdate = false;
-        }
-      })();
-    }, 3_000);
+    // Kick immediately so both players get "last_seen" as early as possible.
+    void pushHeartbeat();
 
     return () => {
       running = false;
       window.clearInterval(heartbeatTimer);
+    };
+  }, [broadcast, match?.id, phase, userId]);
+
+  useEffect(() => {
+    if (phase !== 'playing' || !match) {
+      return;
+    }
+
+    let running = true;
+    let pendingWatchdog = false;
+
+    const runWatchdog = async () => {
+      if (!running || pendingWatchdog) {
+        return;
+      }
+      pendingWatchdog = true;
+      try {
+        const previous = matchRef.current;
+        const reviewed = await checkMatchTimeout(match.id);
+        const currentOpponentId = opponentIdRef.current;
+
+        if (running && (!previous || hasMatchMeaningfulChange(previous, reviewed))) {
+          setMatch(reviewed);
+        }
+
+        if (!running || !currentOpponentId) {
+          return;
+        }
+
+        if (
+          reviewed.disconnect_user_id === currentOpponentId &&
+          reviewed.disconnect_deadline
+        ) {
+          setStatusText((prev) =>
+            prev === '对手疑似断线，已进入 45 秒重连窗口'
+              ? prev
+              : '对手疑似断线，已进入 45 秒重连窗口',
+          );
+        } else if (
+          previous?.disconnect_user_id === currentOpponentId &&
+          reviewed.disconnect_user_id === null
+        ) {
+          setStatusText((prev) =>
+            prev === '对手已重连，比赛继续' ? prev : '对手已重连，比赛继续',
+          );
+        }
+      } catch (error) {
+        if (running) {
+          setStatusText(
+            `断线检测失败：${error instanceof Error ? error.message : 'unknown error'}`,
+          );
+        }
+      } finally {
+        pendingWatchdog = false;
+      }
+    };
+
+    const watchdogTimer = window.setInterval(() => {
+      void runWatchdog();
+    }, 3_000);
+
+    void runWatchdog();
+
+    return () => {
+      running = false;
       window.clearInterval(watchdogTimer);
     };
-  }, [broadcast, match?.id, phase, settleMatchIfNeeded, userId]);
+  }, [match?.id, phase]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

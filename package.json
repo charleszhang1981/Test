@@ -4,10 +4,10 @@
   "private": true,
   "scripts": {
     "build": "next build",
-    "dev": "bash ./scripts/dev.sh",
+    "dev": "next dev --webpack --port 5000",
     "preinstall": "npx only-allow pnpm",
     "lint": "eslint",
-    "start": "next start -p $PORT",
+    "start": "next start --port 5000",
     "ts-check": "tsc -p tsconfig.json"
   },
   "dependencies": {

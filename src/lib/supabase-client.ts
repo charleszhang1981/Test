@@ -1,5 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
+let browserClient: SupabaseClient | null = null;
+
 function getSupabaseClient(token?: string): SupabaseClient {
   // 从环境变量读取 Supabase 配置
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -21,10 +23,26 @@ function getSupabaseClient(token?: string): SupabaseClient {
         timeout: 60000,
       },
       auth: {
-        autoRefreshToken: false,
+        autoRefreshToken: true,
         persistSession: false,
       },
     });
+  }
+
+  if (typeof window !== 'undefined') {
+    if (!browserClient) {
+      browserClient = createClient(url, anonKey, {
+        db: {
+          timeout: 60000,
+        },
+        auth: {
+          autoRefreshToken: true,
+          persistSession: true,
+          detectSessionInUrl: true,
+        },
+      });
+    }
+    return browserClient;
   }
 
   return createClient(url, anonKey, {
@@ -32,7 +50,7 @@ function getSupabaseClient(token?: string): SupabaseClient {
       timeout: 60000,
     },
     auth: {
-      autoRefreshToken: false,
+      autoRefreshToken: true,
       persistSession: false,
     },
   });

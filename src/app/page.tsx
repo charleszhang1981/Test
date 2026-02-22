@@ -201,7 +201,7 @@ const REALM_DIFFICULTIES: RealmDifficulty[] = [
   { gravityMs: 540, aiTickMs: 300, aiLineChance: 0.68, aiMultiLineBias: 0.42, aiMistakeChance: 0 },
   { gravityMs: 470, aiTickMs: 200, aiLineChance: 0.74, aiMultiLineBias: 0.5, aiMistakeChance: 0 },
   { gravityMs: 410, aiTickMs: 100, aiLineChance: 0.8, aiMultiLineBias: 0.58, aiMistakeChance: 0 },
-  { gravityMs: 360, aiTickMs: 100, aiLineChance: 0.86, aiMultiLineBias: 0.66, aiMistakeChance: 0 },
+  { gravityMs: 360, aiTickMs: 100, aiLineChance: 1, aiMultiLineBias: 0.66, aiMistakeChance: 0 },
 ];
 
 const clampRealmLevel = (value: number | null | undefined): number => {
@@ -319,7 +319,8 @@ const evaluateAiBoard = (
     maxHeight * (2.4 - difficulty.aiLineChance) +
     bumpiness * 3.4;
 
-  return clearReward - penalties + Math.random() * 1.2;
+  const explorationNoise = Math.random() * 1.2 * Math.max(0, 1 - difficulty.aiLineChance);
+  return clearReward - penalties + explorationNoise;
 };
 
 const buildAiPlan = (

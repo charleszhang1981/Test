@@ -7,7 +7,7 @@
     "dev": "next dev --webpack --port 5000",
     "preinstall": "npx only-allow pnpm",
     "lint": "eslint",
-    "start": "next start --port 5000",
+    "start": "next start",
     "ts-check": "tsc -p tsconfig.json"
   },
   "dependencies": {

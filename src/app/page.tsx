@@ -194,14 +194,14 @@ interface RealmDifficulty {
 }
 
 const REALM_DIFFICULTIES: RealmDifficulty[] = [
-  { gravityMs: 900, aiTickMs: 900, aiLineChance: 0.35, aiMultiLineBias: 0.1, aiMistakeChance: 0.22 },
-  { gravityMs: 820, aiTickMs: 820, aiLineChance: 0.42, aiMultiLineBias: 0.16, aiMistakeChance: 0.18 },
-  { gravityMs: 720, aiTickMs: 730, aiLineChance: 0.52, aiMultiLineBias: 0.26, aiMistakeChance: 0.12 },
-  { gravityMs: 620, aiTickMs: 660, aiLineChance: 0.6, aiMultiLineBias: 0.34, aiMistakeChance: 0.09 },
-  { gravityMs: 540, aiTickMs: 600, aiLineChance: 0.68, aiMultiLineBias: 0.42, aiMistakeChance: 0.07 },
-  { gravityMs: 470, aiTickMs: 550, aiLineChance: 0.74, aiMultiLineBias: 0.5, aiMistakeChance: 0.05 },
-  { gravityMs: 410, aiTickMs: 500, aiLineChance: 0.8, aiMultiLineBias: 0.58, aiMistakeChance: 0.04 },
-  { gravityMs: 360, aiTickMs: 450, aiLineChance: 0.86, aiMultiLineBias: 0.66, aiMistakeChance: 0.03 },
+  { gravityMs: 900, aiTickMs: 500, aiLineChance: 0.35, aiMultiLineBias: 0.1, aiMistakeChance: 0.05 },
+  { gravityMs: 820, aiTickMs: 450, aiLineChance: 0.42, aiMultiLineBias: 0.16, aiMistakeChance: 0.03 },
+  { gravityMs: 720, aiTickMs: 400, aiLineChance: 0.52, aiMultiLineBias: 0.26, aiMistakeChance: 0.01 },
+  { gravityMs: 620, aiTickMs: 350, aiLineChance: 0.6, aiMultiLineBias: 0.34, aiMistakeChance: 0 },
+  { gravityMs: 540, aiTickMs: 300, aiLineChance: 0.68, aiMultiLineBias: 0.42, aiMistakeChance: 0 },
+  { gravityMs: 470, aiTickMs: 200, aiLineChance: 0.74, aiMultiLineBias: 0.5, aiMistakeChance: 0 },
+  { gravityMs: 410, aiTickMs: 100, aiLineChance: 0.8, aiMultiLineBias: 0.58, aiMistakeChance: 0 },
+  { gravityMs: 360, aiTickMs: 100, aiLineChance: 0.86, aiMultiLineBias: 0.66, aiMistakeChance: 0 },
 ];
 
 const clampRealmLevel = (value: number | null | undefined): number => {

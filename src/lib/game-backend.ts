@@ -370,8 +370,30 @@ export const insertSnapshot = async (payload: {
     .from('match_snapshots')
     .insert(payload)
     .select('*')
-    .single();
-  return unwrap(data as MatchSnapshotRow | null, error);
+    .maybeSingle();
+
+  if (!error) {
+    return unwrap(data as MatchSnapshotRow | null, null);
+  }
+
+  // Two concurrent snapshot writes may race on (match_id, version).
+  // In that case, return the existing row instead of failing the whole match flow.
+  const isDuplicateVersion =
+    error.code === '23505' ||
+    error.message.includes('match_snapshots_match_id_version_key');
+
+  if (isDuplicateVersion) {
+    const { data: existing, error: fetchError } = await client()
+      .from('match_snapshots')
+      .select('*')
+      .eq('match_id', payload.match_id)
+      .eq('version', payload.version)
+      .maybeSingle();
+
+    return unwrap(existing as MatchSnapshotRow | null, fetchError);
+  }
+
+  throw new Error(error.message);
 };
 
 export const fetchSingleLeaderboard = async (

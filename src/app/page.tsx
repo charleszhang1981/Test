@@ -7,7 +7,6 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import type { Session } from '@supabase/supabase-js';
 import {
   Copy,
-  Gauge,
   Gamepad2,
   LogOut,
   Rocket,
@@ -36,8 +35,10 @@ import {
   ensureAnonymousSession,
   fetchLatestSnapshot,
   fetchMatchById,
+  fetchOnlineLeaderboard,
   fetchMyProfile,
   fetchMyPlayerStats,
+  fetchSingleLeaderboard,
   finishMatch,
   heartbeatMatch,
   insertSnapshot,
@@ -76,8 +77,19 @@ import {
 } from '@/lib/tetris-core';
 import { getSupabaseClient } from '@/lib/supabase-client';
 
-type Mode = 'menu' | 'single' | 'online';
+type Mode = 'menu' | 'single' | 'online' | 'local-double';
 type OnlinePhase = 'idle' | 'lobby' | 'playing' | 'ended';
+
+interface HomeStatsPanelState {
+  realmLevel: number;
+  singleRank: number | null;
+  onlineRank: number | null;
+  onlineWinRate: number;
+  singleAiWins: number;
+  onlineWins: number;
+  onlineLosses: number;
+  onlineMatches: number;
+}
 
 interface MatchStartedEvent {
   matchId: string;
@@ -924,6 +936,422 @@ function SingleMode({
   );
 }
 
+function LocalDoubleMode({
+  onBack,
+}: {
+  onBack: () => void;
+}) {
+  const [leftState, setLeftState] = useState<PlayerGameState | null>(null);
+  const [rightState, setRightState] = useState<PlayerGameState | null>(null);
+  const leftStateRef = useRef<PlayerGameState | null>(null);
+  const rightStateRef = useRef<PlayerGameState | null>(null);
+  const leftGeneratorRef = useRef<PieceGenerator | null>(null);
+  const rightGeneratorRef = useRef<PieceGenerator | null>(null);
+  const [running, setRunning] = useState(false);
+  const [gravityMs, setGravityMs] = useState(1000);
+  const [winnerText, setWinnerText] = useState<string | null>(null);
+  const [initialized, setInitialized] = useState(false);
+
+  const commitLeftState = useCallback((next: PlayerGameState) => {
+    leftStateRef.current = next;
+    setLeftState(next);
+  }, []);
+
+  const commitRightState = useCallback((next: PlayerGameState) => {
+    rightStateRef.current = next;
+    setRightState(next);
+  }, []);
+
+  const settleMatch = useCallback((left: PlayerGameState, right: PlayerGameState): boolean => {
+    if (!left.gameOver && !right.gameOver) {
+      return false;
+    }
+
+    setRunning(false);
+
+    if (left.gameOver && !right.gameOver) {
+      setWinnerText(`右玩家胜利（${right.score} : ${left.score}）`);
+      return true;
+    }
+
+    if (!left.gameOver && right.gameOver) {
+      setWinnerText(`左玩家胜利（${left.score} : ${right.score}）`);
+      return true;
+    }
+
+    if (left.score > right.score) {
+      setWinnerText(`左玩家胜利（${left.score} : ${right.score}）`);
+      return true;
+    }
+
+    if (right.score > left.score) {
+      setWinnerText(`右玩家胜利（${right.score} : ${left.score}）`);
+      return true;
+    }
+
+    setWinnerText(`平局（${left.score} : ${right.score}）`);
+    return true;
+  }, []);
+
+  const startGame = useCallback(() => {
+    const leftGenerator = createPieceGenerator(randomSeed());
+    const rightGenerator = createPieceGenerator(randomSeed());
+    const initialLeft = createInitialState(leftGenerator);
+    const initialRight = createInitialState(rightGenerator);
+
+    leftGeneratorRef.current = leftGenerator;
+    rightGeneratorRef.current = rightGenerator;
+    commitLeftState(initialLeft);
+    commitRightState(initialRight);
+    setGravityMs(1000);
+    setWinnerText(null);
+    setInitialized(true);
+    setRunning(true);
+  }, [commitLeftState, commitRightState]);
+
+  const advancePlayer = useCallback(
+    (
+      state: PlayerGameState,
+      generator: PieceGenerator,
+    ): { nextState: PlayerGameState; sentGarbage: number } => {
+      if (state.gameOver) {
+        return { nextState: state, sentGarbage: 0 };
+      }
+
+      const baseState =
+        state.pendingGarbage > 0
+          ? applyPendingGarbage(state, Date.now())
+          : state;
+      const step = stepDown(baseState, generator);
+      return {
+        nextState: step.nextState,
+        sentGarbage: step.sentGarbage,
+      };
+    },
+    [],
+  );
+
+  const tickBoth = useCallback(() => {
+    const leftCurrent = leftStateRef.current;
+    const rightCurrent = rightStateRef.current;
+    const leftGenerator = leftGeneratorRef.current;
+    const rightGenerator = rightGeneratorRef.current;
+
+    if (!leftCurrent || !rightCurrent || !leftGenerator || !rightGenerator) {
+      return;
+    }
+
+    const leftAdvanced = advancePlayer(leftCurrent, leftGenerator);
+    const rightAdvanced = advancePlayer(rightCurrent, rightGenerator);
+
+    let leftNext = leftAdvanced.nextState;
+    let rightNext = rightAdvanced.nextState;
+
+    if (leftAdvanced.sentGarbage > 0 && !rightNext.gameOver) {
+      rightNext = {
+        ...rightNext,
+        pendingGarbage: rightNext.pendingGarbage + leftAdvanced.sentGarbage,
+      };
+    }
+
+    if (rightAdvanced.sentGarbage > 0 && !leftNext.gameOver) {
+      leftNext = {
+        ...leftNext,
+        pendingGarbage: leftNext.pendingGarbage + rightAdvanced.sentGarbage,
+      };
+    }
+
+    commitLeftState(leftNext);
+    commitRightState(rightNext);
+    void settleMatch(leftNext, rightNext);
+  }, [advancePlayer, commitLeftState, commitRightState, settleMatch]);
+
+  const stepOne = useCallback(
+    (side: 'left' | 'right') => {
+      const leftCurrent = leftStateRef.current;
+      const rightCurrent = rightStateRef.current;
+      const leftGenerator = leftGeneratorRef.current;
+      const rightGenerator = rightGeneratorRef.current;
+
+      if (!leftCurrent || !rightCurrent || !leftGenerator || !rightGenerator) {
+        return;
+      }
+
+      if (side === 'left') {
+        if (leftCurrent.gameOver) {
+          return;
+        }
+
+        const baseState =
+          leftCurrent.pendingGarbage > 0
+            ? applyPendingGarbage(leftCurrent, Date.now())
+            : leftCurrent;
+        const step = stepDown(baseState, leftGenerator);
+        let nextRight = rightCurrent;
+        if (step.sentGarbage > 0 && !rightCurrent.gameOver) {
+          nextRight = {
+            ...rightCurrent,
+            pendingGarbage: rightCurrent.pendingGarbage + step.sentGarbage,
+          };
+        }
+        commitLeftState(step.nextState);
+        commitRightState(nextRight);
+        void settleMatch(step.nextState, nextRight);
+        return;
+      }
+
+      if (rightCurrent.gameOver) {
+        return;
+      }
+
+      const baseState =
+        rightCurrent.pendingGarbage > 0
+          ? applyPendingGarbage(rightCurrent, Date.now())
+          : rightCurrent;
+      const step = stepDown(baseState, rightGenerator);
+      let nextLeft = leftCurrent;
+      if (step.sentGarbage > 0 && !leftCurrent.gameOver) {
+        nextLeft = {
+          ...leftCurrent,
+          pendingGarbage: leftCurrent.pendingGarbage + step.sentGarbage,
+        };
+      }
+      commitRightState(step.nextState);
+      commitLeftState(nextLeft);
+      void settleMatch(nextLeft, step.nextState);
+    },
+    [commitLeftState, commitRightState, settleMatch],
+  );
+
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      tickBoth();
+    }, gravityMs);
+    return () => window.clearInterval(timer);
+  }, [gravityMs, running, tickBoth]);
+
+  useEffect(() => {
+    if (!running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setGravityMs((prev) => Math.max(120, Math.round(prev * 0.9)));
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!running) {
+        return;
+      }
+
+      if (event.key === 'a' || event.key === 'A') {
+        event.preventDefault();
+        const current = leftStateRef.current;
+        if (current && !current.gameOver) {
+          commitLeftState(moveHorizontal(current, -1));
+        }
+        return;
+      }
+
+      if (event.key === 'd' || event.key === 'D') {
+        event.preventDefault();
+        const current = leftStateRef.current;
+        if (current && !current.gameOver) {
+          commitLeftState(moveHorizontal(current, 1));
+        }
+        return;
+      }
+
+      if (event.key === 'w' || event.key === 'W') {
+        event.preventDefault();
+        const current = leftStateRef.current;
+        if (current && !current.gameOver) {
+          commitLeftState(rotateCurrent(current));
+        }
+        return;
+      }
+
+      if (event.key === 's' || event.key === 'S') {
+        event.preventDefault();
+        stepOne('left');
+        return;
+      }
+
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        const current = rightStateRef.current;
+        if (current && !current.gameOver) {
+          commitRightState(moveHorizontal(current, -1));
+        }
+        return;
+      }
+
+      if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        const current = rightStateRef.current;
+        if (current && !current.gameOver) {
+          commitRightState(moveHorizontal(current, 1));
+        }
+        return;
+      }
+
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        const current = rightStateRef.current;
+        if (current && !current.gameOver) {
+          commitRightState(rotateCurrent(current));
+        }
+        return;
+      }
+
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        stepOne('right');
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [commitLeftState, commitRightState, running, stepOne]);
+
+  const leftBoard = useMemo(() => {
+    if (!leftState) {
+      return createEmptyBoard();
+    }
+    return withActivePiece(leftState);
+  }, [leftState]);
+
+  const rightBoard = useMemo(() => {
+    if (!rightState) {
+      return createEmptyBoard();
+    }
+    return withActivePiece(rightState);
+  }, [rightState]);
+
+  const stateLabel = running ? '对战进行中' : winnerText ? '本局结束' : '等待开局';
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-black tracking-tight text-white">本地双人对战</h2>
+          <p className="text-sm text-slate-400">
+            同一键盘对战（匿名可玩，不计分，不进排行榜）
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={onBack} className="border-slate-600 bg-slate-900/70 text-slate-200">
+            返回菜单
+          </Button>
+          <Button onClick={startGame} className="bg-indigo-500 text-white hover:bg-indigo-400">
+            {running ? '重新开局' : winnerText ? '再来一局' : '开始对战'}
+          </Button>
+        </div>
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+          <CardHeader className="px-4 py-0">
+            <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">状态</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4">
+            <p className="mt-2 text-sm font-semibold text-slate-200">{stateLabel}</p>
+            <p className="text-xs text-slate-500">规则：消 2/3/4 行会向对手发送 2/3/4 行垃圾</p>
+          </CardContent>
+        </Card>
+        <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+          <CardHeader className="px-4 py-0">
+            <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">当前速度</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4">
+            <p className="mt-2 text-2xl font-black text-cyan-300">{(1000 / gravityMs).toFixed(2)} 格/秒</p>
+            <p className="text-xs text-slate-500">每 60 秒提速 10%</p>
+          </CardContent>
+        </Card>
+        <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+          <CardHeader className="px-4 py-0">
+            <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">键位</CardTitle>
+          </CardHeader>
+          <CardContent className="px-4 text-xs text-slate-300">
+            <p>左玩家：W/A/S/D</p>
+            <p>右玩家：↑/←/↓/→</p>
+          </CardContent>
+        </Card>
+      </div>
+
+      {initialized && leftState && rightState ? (
+        <>
+          <div className="grid gap-3 sm:grid-cols-4">
+            <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+              <CardHeader className="px-4 py-0">
+                <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">左玩家分数</CardTitle>
+              </CardHeader>
+              <CardContent className="px-4">
+                <p className="mt-2 text-2xl font-black text-cyan-300">{leftState.score}</p>
+              </CardContent>
+            </Card>
+            <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+              <CardHeader className="px-4 py-0">
+                <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">右玩家分数</CardTitle>
+              </CardHeader>
+              <CardContent className="px-4">
+                <p className="mt-2 text-2xl font-black text-orange-300">{rightState.score}</p>
+              </CardContent>
+            </Card>
+            <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+              <CardHeader className="px-4 py-0">
+                <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">左玩家待处理垃圾</CardTitle>
+              </CardHeader>
+              <CardContent className="px-4">
+                <p className="mt-2 text-2xl font-black text-fuchsia-300">{leftState.pendingGarbage}</p>
+              </CardContent>
+            </Card>
+            <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+              <CardHeader className="px-4 py-0">
+                <CardTitle className="text-xs uppercase tracking-[0.2em] text-slate-400">右玩家待处理垃圾</CardTitle>
+              </CardHeader>
+              <CardContent className="px-4">
+                <p className="mt-2 text-2xl font-black text-violet-300">{rightState.pendingGarbage}</p>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="flex justify-center">
+            <div className="grid w-fit gap-4 lg:grid-cols-2">
+              <BoardGrid board={leftBoard} gameOver={leftState.gameOver} title="左玩家" />
+              <BoardGrid board={rightBoard} gameOver={rightState.gameOver} title="右玩家" />
+            </div>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-2">
+            <NextBlockCard blockType={leftState.nextBlock} />
+            <NextBlockCard blockType={rightState.nextBlock} />
+          </div>
+        </>
+      ) : (
+        <Card className="border-slate-700/60 bg-slate-900/50 py-3 shadow-none">
+          <CardContent className="px-4 text-sm text-slate-300">
+            点击“开始对战”后进入双人对局。左玩家使用 WASD，右玩家使用方向键。
+          </CardContent>
+        </Card>
+      )}
+
+      {winnerText && (
+        <Card className="border-emerald-400/40 bg-emerald-500/10 py-3 shadow-none">
+          <CardContent className="px-4">
+            <p className="text-sm font-semibold text-emerald-200">{winnerText}</p>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
 function OnlineMode({
   session,
   profile,
@@ -971,6 +1399,7 @@ function OnlineMode({
   const snapshotVersionRef = useRef(0);
   const locksSinceSnapshotRef = useRef(0);
   const lastSnapshotAtRef = useRef(0);
+  const snapshotWritingRef = useRef(false);
 
   const opponentHeartbeatRef = useRef(Date.now());
   const [statusText, setStatusText] = useState('创建房间或输入房间码加入');
@@ -1069,6 +1498,7 @@ function OnlineMode({
     snapshotVersionRef.current = 0;
     locksSinceSnapshotRef.current = 0;
     lastSnapshotAtRef.current = 0;
+    snapshotWritingRef.current = false;
     opponentHeartbeatRef.current = Date.now();
     generatorRef.current = null;
     localStateRef.current = null;
@@ -1104,6 +1534,9 @@ function OnlineMode({
 
   const persistSnapshotMaybe = useCallback(
     async (force = false) => {
+      if (snapshotWritingRef.current) {
+        return;
+      }
       if (!isHost || !matchRef.current || !localStateRef.current) {
         return;
       }
@@ -1125,6 +1558,7 @@ function OnlineMode({
       }
 
       const nextVersion = snapshotVersionRef.current + 1;
+      snapshotVersionRef.current = nextVersion;
 
       const hostBoard = isHost ? local.board : remote.board;
       const guestBoard = isHost ? remote.board : local.board;
@@ -1135,23 +1569,40 @@ function OnlineMode({
       const hostPending = isHost ? local.pendingGarbage : remote.pendingGarbage;
       const guestPending = isHost ? remote.pendingGarbage : local.pendingGarbage;
 
-      await insertSnapshot({
-        match_id: currentMatch.id,
-        version: nextVersion,
-        from_user_id: userId,
-        host_seq: hostSeq,
-        guest_seq: guestSeq,
-        host_board_fixed: hostBoard,
-        guest_board_fixed: guestBoard,
-        host_score: hostScore,
-        guest_score: guestScore,
-        host_pending_garbage: hostPending,
-        guest_pending_garbage: guestPending,
-      });
+      snapshotWritingRef.current = true;
+      try {
+        await insertSnapshot({
+          match_id: currentMatch.id,
+          version: nextVersion,
+          from_user_id: userId,
+          host_seq: hostSeq,
+          guest_seq: guestSeq,
+          host_board_fixed: hostBoard,
+          guest_board_fixed: guestBoard,
+          host_score: hostScore,
+          guest_score: guestScore,
+          host_pending_garbage: hostPending,
+          guest_pending_garbage: guestPending,
+        });
 
-      snapshotVersionRef.current = nextVersion;
-      locksSinceSnapshotRef.current = 0;
-      lastSnapshotAtRef.current = now;
+        locksSinceSnapshotRef.current = 0;
+        lastSnapshotAtRef.current = now;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : 'unknown error';
+        const isDuplicateVersion =
+          message.includes('match_snapshots_match_id_version_key');
+
+        if (!isDuplicateVersion) {
+          setStatusText((prev) =>
+            prev.startsWith('快照写入失败')
+              ? prev
+              : `快照写入失败：${message}`,
+          );
+        }
+      } finally {
+        snapshotWritingRef.current = false;
+      }
     },
     [isHost, userId],
   );
@@ -2187,7 +2638,10 @@ function HomePageContent() {
   const initialMatchId = searchParams.get('matchId');
 
   const [mode, setMode] = useState<Mode>(
-    popupMode && (requestedMode === 'single' || requestedMode === 'online')
+    popupMode &&
+      (requestedMode === 'single' ||
+        requestedMode === 'online' ||
+        requestedMode === 'local-double')
       ? requestedMode
       : 'menu',
   );
@@ -2204,9 +2658,12 @@ function HomePageContent() {
   const [registerPassword, setRegisterPassword] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authTab, setAuthTab] = useState<'login' | 'register'>('login');
+  const [homeStats, setHomeStats] = useState<HomeStatsPanelState | null>(null);
+  const [homeStatsLoading, setHomeStatsLoading] = useState(false);
+  const [homeStatsError, setHomeStatsError] = useState('');
 
   const navigateToMode = useCallback(
-    (nextMode: 'single' | 'online', matchId?: string) => {
+    (nextMode: 'single' | 'online' | 'local-double', matchId?: string) => {
       const params = new URLSearchParams();
       params.set('mode', nextMode);
       params.set('popup', '1');
@@ -2230,7 +2687,9 @@ function HomePageContent() {
   useEffect(() => {
     if (
       popupMode &&
-      (requestedMode === 'single' || requestedMode === 'online')
+      (requestedMode === 'single' ||
+        requestedMode === 'online' ||
+        requestedMode === 'local-double')
     ) {
       setMode(requestedMode);
       return;
@@ -2376,6 +2835,72 @@ function HomePageContent() {
     }
   }, [profile?.is_anonymous]);
 
+  useEffect(() => {
+    const userId = session?.user.id;
+    if (!userId || profile?.is_anonymous !== false) {
+      setHomeStats(null);
+      setHomeStatsLoading(false);
+      setHomeStatsError('');
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadHomeStats = async () => {
+      setHomeStatsLoading(true);
+      setHomeStatsError('');
+      try {
+        const [stats, singleLeaderboard, onlineLeaderboard] = await Promise.all([
+          fetchMyPlayerStats(),
+          fetchSingleLeaderboard(1000),
+          fetchOnlineLeaderboard(1000),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
+        const singleRankIndex = singleLeaderboard.findIndex((row) => row.user_id === userId);
+        const onlineRankIndex = onlineLeaderboard.findIndex((row) => row.user_id === userId);
+
+        const onlineWins = stats?.online_wins ?? 0;
+        const onlineLosses = stats?.online_losses ?? 0;
+        const onlineMatches = stats?.online_matches_played ?? 0;
+        const onlineWinRate =
+          onlineMatches > 0 ? (onlineWins / onlineMatches) * 100 : 0;
+
+        setHomeStats({
+          realmLevel: clampRealmLevel(stats?.single_realm_level),
+          singleRank: singleRankIndex >= 0 ? singleRankIndex + 1 : null,
+          onlineRank: onlineRankIndex >= 0 ? onlineRankIndex + 1 : null,
+          onlineWinRate,
+          singleAiWins: stats?.single_ai_wins ?? 0,
+          onlineWins,
+          onlineLosses,
+          onlineMatches,
+        });
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setHomeStats(null);
+        setHomeStatsError(
+          `战绩读取失败：${error instanceof Error ? error.message : 'unknown error'}`,
+        );
+      } finally {
+        if (!cancelled) {
+          setHomeStatsLoading(false);
+        }
+      }
+    };
+
+    void loadHomeStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [profile?.is_anonymous, session?.user.id]);
+
   if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-200">
@@ -2385,7 +2910,8 @@ function HomePageContent() {
   }
 
   const isAnonymous = profile?.is_anonymous ?? true;
-  const authLocked = !isAnonymous;
+  const singleRankLabel = homeStats?.singleRank ? `#${homeStats.singleRank}` : '未上榜';
+  const onlineRankLabel = homeStats?.onlineRank ? `#${homeStats.onlineRank}` : '未上榜';
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_20%_10%,rgba(56,189,248,0.25),transparent_38%),radial-gradient(circle_at_80%_0%,rgba(16,185,129,0.24),transparent_34%),linear-gradient(145deg,#020617,#111827_55%,#1e293b)] px-4 py-6 text-slate-100 sm:px-6 lg:px-10">
@@ -2440,6 +2966,19 @@ function HomePageContent() {
                     <p className="mt-1 text-xs text-slate-300">进入房间大厅，双方就绪后自动进入对局</p>
                   </button>
 
+                  <button
+                    type="button"
+                    onClick={() => navigateToMode('local-double')}
+                    className="rounded-2xl border border-violet-300/40 bg-violet-400/10 p-4 text-left transition hover:-translate-y-0.5 hover:bg-violet-400/20"
+                  >
+                    <div className="mb-2 flex items-center gap-2 text-violet-100">
+                      <Users className="h-4 w-4" />
+                      <span className="text-xs uppercase tracking-[0.2em]">Local Double</span>
+                    </div>
+                    <p className="text-lg font-bold text-white">本地双人对战</p>
+                    <p className="mt-1 text-xs text-slate-300">同一键盘即开即玩，不联网不计分</p>
+                  </button>
+
                   <Link
                     href="/leaderboard"
                     className="rounded-2xl border border-amber-300/40 bg-amber-300/10 p-4 text-left transition hover:-translate-y-0.5 hover:bg-amber-300/20"
@@ -2451,22 +2990,15 @@ function HomePageContent() {
                     <p className="text-lg font-bold text-white">排行榜大厅</p>
                     <p className="mt-1 text-xs text-slate-300">单机榜 + 联网积分榜</p>
                   </Link>
-
-                  <div className="rounded-2xl border border-fuchsia-400/30 bg-fuchsia-500/10 p-4 text-left">
-                    <div className="mb-2 flex items-center gap-2 text-fuchsia-100">
-                      <Gauge className="h-4 w-4" />
-                      <span className="text-xs uppercase tracking-[0.2em]">Coming Soon</span>
-                    </div>
-                    <p className="text-lg font-bold text-white">新功能开发中...</p>
-                    <p className="mt-1 text-xs text-slate-300">敬请期待更多玩法与活动</p>
-                  </div>
                 </div>
 
                 <Card className="border-slate-700/70 bg-slate-950/55 py-4 shadow-none">
                   <CardHeader className="px-4 py-0">
                     <CardTitle className="text-sm text-slate-100">账号与身份</CardTitle>
                     <CardDescription className="text-xs text-slate-400">
-                      匿名可玩联机；注册后才累计积分并进排行榜
+                      {isAnonymous
+                        ? '匿名可玩联机；注册后才累计积分并进排行榜'
+                        : '已登录：展示当前修为、名次与胜率'}
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3 px-4">
@@ -2480,89 +3012,131 @@ function HomePageContent() {
                       </Badge>
                     </div>
 
-                    <Tabs
-                      value={authTab}
-                      onValueChange={(value) => {
-                        if (!authLocked) {
+                    {isAnonymous ? (
+                      <Tabs
+                        value={authTab}
+                        onValueChange={(value) => {
                           setAuthTab(value as 'login' | 'register');
-                        }
-                      }}
-                      className={`space-y-3 ${authLocked ? 'opacity-50' : ''}`}
-                    >
-                      <TabsList className="w-full bg-slate-900/90 p-1">
-                        <TabsTrigger
-                          value="login"
-                          disabled={authLocked}
-                          className="flex-1 border border-transparent text-slate-200 hover:text-white disabled:cursor-not-allowed disabled:opacity-60 data-[state=active]:border-indigo-300/40 data-[state=active]:bg-indigo-500 data-[state=active]:text-white"
-                        >
-                          登录
-                        </TabsTrigger>
-                        <TabsTrigger
-                          value="register"
-                          disabled={authLocked}
-                          className="flex-1 border border-transparent text-slate-200 hover:text-white disabled:cursor-not-allowed disabled:opacity-60 data-[state=active]:border-emerald-300/40 data-[state=active]:bg-emerald-500 data-[state=active]:text-slate-950"
-                        >
-                          注册
-                        </TabsTrigger>
-                      </TabsList>
+                        }}
+                        className="space-y-3"
+                      >
+                        <TabsList className="w-full bg-slate-900/90 p-1">
+                          <TabsTrigger
+                            value="login"
+                            className="flex-1 border border-transparent text-slate-200 hover:text-white data-[state=active]:border-indigo-300/40 data-[state=active]:bg-indigo-500 data-[state=active]:text-white"
+                          >
+                            登录
+                          </TabsTrigger>
+                          <TabsTrigger
+                            value="register"
+                            className="flex-1 border border-transparent text-slate-200 hover:text-white data-[state=active]:border-emerald-300/40 data-[state=active]:bg-emerald-500 data-[state=active]:text-slate-950"
+                          >
+                            注册
+                          </TabsTrigger>
+                        </TabsList>
 
-                      <TabsContent value="login" className="space-y-2">
-                        <Input
-                          value={loginEmail}
-                          onChange={(event) => setLoginEmail(event.target.value)}
-                          placeholder="登录邮箱"
-                          disabled={authBusy || authLocked}
-                          className="border-slate-700 bg-slate-950/70 text-slate-100"
-                        />
-                        <Input
-                          value={loginPassword}
-                          onChange={(event) => setLoginPassword(event.target.value)}
-                          placeholder="登录密码"
-                          type="password"
-                          disabled={authBusy || authLocked}
-                          className="border-slate-700 bg-slate-950/70 text-slate-100"
-                        />
-                        <Button
-                          disabled={authBusy || authLocked}
-                          onClick={() => void login()}
-                          className="w-full bg-indigo-500 text-white hover:bg-indigo-400"
-                        >
-                          <User className="mr-1 h-4 w-4" /> 登录
-                        </Button>
-                      </TabsContent>
+                        <TabsContent value="login" className="space-y-2">
+                          <Input
+                            value={loginEmail}
+                            onChange={(event) => setLoginEmail(event.target.value)}
+                            placeholder="登录邮箱"
+                            disabled={authBusy}
+                            className="border-slate-700 bg-slate-950/70 text-slate-100"
+                          />
+                          <Input
+                            value={loginPassword}
+                            onChange={(event) => setLoginPassword(event.target.value)}
+                            placeholder="登录密码"
+                            type="password"
+                            disabled={authBusy}
+                            className="border-slate-700 bg-slate-950/70 text-slate-100"
+                          />
+                          <Button
+                            disabled={authBusy}
+                            onClick={() => void login()}
+                            className="w-full bg-indigo-500 text-white hover:bg-indigo-400"
+                          >
+                            <User className="mr-1 h-4 w-4" /> 登录
+                          </Button>
+                        </TabsContent>
 
-                      <TabsContent value="register" className="space-y-2">
-                        <Input
-                          value={registerName}
-                          onChange={(event) => setRegisterName(event.target.value)}
-                          placeholder="注册昵称"
-                          disabled={authBusy || authLocked}
-                          className="border-slate-700 bg-slate-950/70 text-slate-100"
-                        />
-                        <Input
-                          value={registerEmail}
-                          onChange={(event) => setRegisterEmail(event.target.value)}
-                          placeholder="注册邮箱"
-                          disabled={authBusy || authLocked}
-                          className="border-slate-700 bg-slate-950/70 text-slate-100"
-                        />
-                        <Input
-                          value={registerPassword}
-                          onChange={(event) => setRegisterPassword(event.target.value)}
-                          placeholder="注册密码"
-                          type="password"
-                          disabled={authBusy || authLocked}
-                          className="border-slate-700 bg-slate-950/70 text-slate-100"
-                        />
-                        <Button
-                          disabled={authBusy || authLocked}
-                          onClick={() => void register()}
-                          className="w-full bg-emerald-500 text-slate-950 hover:bg-emerald-400"
-                        >
-                          <UserRoundPlus className="mr-1 h-4 w-4" /> 注册并登录
-                        </Button>
-                      </TabsContent>
-                    </Tabs>
+                        <TabsContent value="register" className="space-y-2">
+                          <Input
+                            value={registerName}
+                            onChange={(event) => setRegisterName(event.target.value)}
+                            placeholder="注册昵称"
+                            disabled={authBusy}
+                            className="border-slate-700 bg-slate-950/70 text-slate-100"
+                          />
+                          <Input
+                            value={registerEmail}
+                            onChange={(event) => setRegisterEmail(event.target.value)}
+                            placeholder="注册邮箱"
+                            disabled={authBusy}
+                            className="border-slate-700 bg-slate-950/70 text-slate-100"
+                          />
+                          <Input
+                            value={registerPassword}
+                            onChange={(event) => setRegisterPassword(event.target.value)}
+                            placeholder="注册密码"
+                            type="password"
+                            disabled={authBusy}
+                            className="border-slate-700 bg-slate-950/70 text-slate-100"
+                          />
+                          <Button
+                            disabled={authBusy}
+                            onClick={() => void register()}
+                            className="w-full bg-emerald-500 text-slate-950 hover:bg-emerald-400"
+                          >
+                            <UserRoundPlus className="mr-1 h-4 w-4" /> 注册并登录
+                          </Button>
+                        </TabsContent>
+                      </Tabs>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="rounded-lg border border-cyan-300/35 bg-cyan-500/15 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.16em] text-cyan-100/80">修为等级</p>
+                            <p className="mt-1 text-sm font-bold text-white">
+                              {homeStatsLoading
+                                ? '读取中...'
+                                : homeStats
+                                  ? `${realmLabel(homeStats.realmLevel)}（${homeStats.realmLevel}/8）`
+                                  : '--'}
+                            </p>
+                          </div>
+                          <div className="rounded-lg border border-amber-300/35 bg-amber-500/15 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.16em] text-amber-100/85">单机名次</p>
+                            <p className="mt-1 text-sm font-bold text-white">
+                              {homeStatsLoading ? '读取中...' : singleRankLabel}
+                            </p>
+                          </div>
+                          <div className="rounded-lg border border-violet-300/35 bg-violet-500/15 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.16em] text-violet-100/85">联网名次</p>
+                            <p className="mt-1 text-sm font-bold text-white">
+                              {homeStatsLoading ? '读取中...' : onlineRankLabel}
+                            </p>
+                          </div>
+                          <div className="rounded-lg border border-emerald-300/35 bg-emerald-500/15 px-3 py-2">
+                            <p className="text-[11px] uppercase tracking-[0.16em] text-emerald-100/85">联网胜率</p>
+                            <p className="mt-1 text-sm font-bold text-white">
+                              {homeStatsLoading
+                                ? '读取中...'
+                                : `${(homeStats?.onlineWinRate ?? 0).toFixed(1)}%`}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="rounded-lg border border-slate-700/70 bg-slate-900/70 px-3 py-2">
+                          <p className="text-[11px] uppercase tracking-[0.16em] text-slate-400">战绩摘要</p>
+                          <p className="mt-1 text-xs text-slate-200">
+                            {homeStatsLoading
+                              ? '正在加载战绩...'
+                              : `单机胜场 ${homeStats?.singleAiWins ?? 0} · 联网 ${homeStats?.onlineWins ?? 0}W / ${homeStats?.onlineLosses ?? 0}L / ${homeStats?.onlineMatches ?? 0} 场`}
+                          </p>
+                        </div>
+                      </div>
+                    )}
 
                     <Button
                       variant="outline"
@@ -2572,6 +3146,12 @@ function HomePageContent() {
                     >
                       <LogOut className="mr-1 h-4 w-4" /> 登出
                     </Button>
+
+                    {homeStatsError && !isAnonymous && (
+                      <p className="rounded-md border border-rose-400/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-100">
+                        {homeStatsError}
+                      </p>
+                    )}
 
                     {authMessage && (
                       <p className="rounded-md border border-slate-700/70 bg-slate-900/70 px-2 py-1 text-xs text-slate-300">
@@ -2588,7 +3168,13 @@ function HomePageContent() {
         {popupMode && (
           <Card className="border-slate-700/70 bg-slate-900/60 py-3">
             <CardContent className="flex items-center justify-between gap-3 px-4 sm:px-6">
-              <p className="text-sm text-slate-300">{mode === 'online' ? '联网模式' : '单机模式'}</p>
+              <p className="text-sm text-slate-300">
+                {mode === 'online'
+                  ? '联网模式'
+                  : mode === 'local-double'
+                    ? '本地双人模式'
+                    : '单机模式'}
+              </p>
               <Link href="/" className="text-sm text-cyan-200 underline underline-offset-4">
                 返回主页
               </Link>
@@ -2618,6 +3204,14 @@ function HomePageContent() {
                 onBack={() => router.push('/')}
                 initialMatchId={initialMatchId}
               />
+            </CardContent>
+          </Card>
+        )}
+
+        {mode === 'local-double' && (
+          <Card className="border-slate-700/80 bg-slate-900/65 py-4 shadow-[0_0_80px_rgba(167,139,250,0.08)]">
+            <CardContent className="px-4 sm:px-6">
+              <LocalDoubleMode onBack={() => router.push('/')} />
             </CardContent>
           </Card>
         )}

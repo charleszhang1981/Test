@@ -206,13 +206,13 @@ interface RealmDifficulty {
 }
 
 const REALM_DIFFICULTIES: RealmDifficulty[] = [
-  { gravityMs: 900, aiTickMs: 500, aiLineChance: 0.35, aiMultiLineBias: 0.1, aiMistakeChance: 0.05 },
-  { gravityMs: 820, aiTickMs: 450, aiLineChance: 0.42, aiMultiLineBias: 0.16, aiMistakeChance: 0.03 },
-  { gravityMs: 720, aiTickMs: 400, aiLineChance: 0.52, aiMultiLineBias: 0.26, aiMistakeChance: 0.01 },
-  { gravityMs: 620, aiTickMs: 350, aiLineChance: 0.6, aiMultiLineBias: 0.34, aiMistakeChance: 0 },
-  { gravityMs: 540, aiTickMs: 300, aiLineChance: 0.68, aiMultiLineBias: 0.42, aiMistakeChance: 0 },
-  { gravityMs: 470, aiTickMs: 200, aiLineChance: 0.74, aiMultiLineBias: 0.5, aiMistakeChance: 0 },
-  { gravityMs: 410, aiTickMs: 100, aiLineChance: 0.8, aiMultiLineBias: 0.58, aiMistakeChance: 0 },
+  { gravityMs: 900, aiTickMs: 500, aiLineChance: 0.36, aiMultiLineBias: 0.1, aiMistakeChance: 0.03 },
+  { gravityMs: 820, aiTickMs: 450, aiLineChance: 0.44, aiMultiLineBias: 0.16, aiMistakeChance: 0.01 },
+  { gravityMs: 720, aiTickMs: 400, aiLineChance: 0.54, aiMultiLineBias: 0.26, aiMistakeChance: 0 },
+  { gravityMs: 620, aiTickMs: 350, aiLineChance: 0.7, aiMultiLineBias: 0.34, aiMistakeChance: 0 },
+  { gravityMs: 540, aiTickMs: 300, aiLineChance: 0.78, aiMultiLineBias: 0.42, aiMistakeChance: 0 },
+  { gravityMs: 470, aiTickMs: 200, aiLineChance: 0.84, aiMultiLineBias: 0.5, aiMistakeChance: 0 },
+  { gravityMs: 410, aiTickMs: 100, aiLineChance: 0.9, aiMultiLineBias: 0.58, aiMistakeChance: 0 },
   { gravityMs: 360, aiTickMs: 100, aiLineChance: 1, aiMultiLineBias: 0.66, aiMistakeChance: 0 },
 ];
 
@@ -233,8 +233,30 @@ interface AiPlan {
 interface AiCandidate {
   targetCol: number;
   targetShape: number[][];
-  score: number;
+  firstScore: number;
+  nextScore: number;
+  totalScore: number;
 }
+
+interface AiPlacement {
+  targetCol: number;
+  targetShape: number[][];
+  nextBoard: BoardCell[][];
+  clearedLines: number;
+  boardScore: number;
+}
+
+const AI_LOOKAHEAD_BEAM_WIDTH = 8;
+const AI_CHOICE_POOL_MIN = 2;
+const AI_CHOICE_POOL_MAX = 4;
+const AI_FIRST_SCORE_WEIGHT = 0.4;
+const AI_NEXT_SCORE_WEIGHT = 0.6;
+const AI_DEAD_END_PENALTY = 1200;
+const AI_ATTACK_BONUS: Record<number, number> = {
+  2: 95,
+  3: 150,
+  4: 220,
+};
 
 const shapeKey = (shape: number[][]): string =>
   shape.map((row) => row.join('')).join('|');
@@ -331,45 +353,127 @@ const evaluateAiBoard = (
     maxHeight * (2.4 - difficulty.aiLineChance) +
     bumpiness * 3.4;
 
-  const explorationNoise = Math.random() * 1.2 * Math.max(0, 1 - difficulty.aiLineChance);
-  return clearReward - penalties + explorationNoise;
+  return clearReward - penalties;
+};
+
+const attackBonusForLines = (
+  clearedLines: number,
+  difficulty: RealmDifficulty,
+): number => {
+  const base = AI_ATTACK_BONUS[clearedLines] ?? 0;
+  if (base <= 0) {
+    return 0;
+  }
+  const aggressionScale =
+    0.82 + difficulty.aiLineChance * 0.35 + difficulty.aiMultiLineBias * 0.25;
+  return base * aggressionScale;
+};
+
+const deadEndPenaltyForDifficulty = (difficulty: RealmDifficulty): number =>
+  AI_DEAD_END_PENALTY * (0.95 + difficulty.aiLineChance * 0.35);
+
+const choicePoolSizeForDifficulty = (difficulty: RealmDifficulty): number => {
+  const raw = Math.round(AI_CHOICE_POOL_MAX - difficulty.aiLineChance * 2);
+  return Math.min(AI_CHOICE_POOL_MAX, Math.max(AI_CHOICE_POOL_MIN, raw));
+};
+
+const enumeratePlacements = (
+  board: BoardCell[][],
+  block: BlockType,
+  baseShape: number[][],
+  startRow: number,
+  difficulty: RealmDifficulty,
+): AiPlacement[] => {
+  const placements: AiPlacement[] = [];
+  const rotations = getUniqueRotations(baseShape);
+
+  for (const shape of rotations) {
+    for (let col = -4; col < COLS + 4; col++) {
+      const dropRow = findDropRow(board, shape, startRow, col);
+      if (dropRow === null) {
+        continue;
+      }
+
+      const locked = lockBlock(board, shape, dropRow, col, block);
+      const { nextBoard, clearedLines } = clearLines(locked);
+      placements.push({
+        targetCol: col,
+        targetShape: shape,
+        nextBoard,
+        clearedLines,
+        boardScore: evaluateAiBoard(nextBoard, clearedLines, difficulty),
+      });
+    }
+  }
+
+  return placements;
 };
 
 const buildAiPlan = (
   state: PlayerGameState,
   difficulty: RealmDifficulty,
 ): AiPlan | null => {
-  const rotations = getUniqueRotations(state.currentShape);
-  const candidates: AiCandidate[] = [];
-
-  for (const shape of rotations) {
-    for (let col = -4; col < COLS + 4; col++) {
-      const dropRow = findDropRow(state.board, shape, state.currentPos.row, col);
-      if (dropRow === null) {
-        continue;
-      }
-
-      const locked = lockBlock(
-        state.board,
-        shape,
-        dropRow,
-        col,
-        state.currentBlock,
-      );
-      const { nextBoard, clearedLines } = clearLines(locked);
-      candidates.push({
-        targetCol: col,
-        targetShape: shape,
-        score: evaluateAiBoard(nextBoard, clearedLines, difficulty),
-      });
-    }
-  }
-
-  if (candidates.length === 0) {
+  const firstPlacements = enumeratePlacements(
+    state.board,
+    state.currentBlock,
+    state.currentShape,
+    state.currentPos.row,
+    difficulty,
+  );
+  if (firstPlacements.length === 0) {
     return null;
   }
 
-  candidates.sort((a, b) => b.score - a.score);
+  firstPlacements.sort((a, b) => b.boardScore - a.boardScore);
+  const firstLayerPool = firstPlacements.slice(
+    0,
+    Math.min(AI_LOOKAHEAD_BEAM_WIDTH, firstPlacements.length),
+  );
+  const nextShape = BLOCK_SHAPES[state.nextBlock];
+
+  const candidates: AiCandidate[] = firstLayerPool.map((firstPlacement) => {
+    const nextPlacements = enumeratePlacements(
+      firstPlacement.nextBoard,
+      state.nextBlock,
+      nextShape,
+      0,
+      difficulty,
+    );
+
+    let nextScore = firstPlacement.boardScore;
+    let nextAttackBonus = 0;
+    let deadEndPenalty = 0;
+
+    if (nextPlacements.length === 0) {
+      deadEndPenalty = deadEndPenaltyForDifficulty(difficulty);
+    } else {
+      nextPlacements.sort((a, b) => b.boardScore - a.boardScore);
+      const nextBest = nextPlacements[0];
+      nextScore = nextBest.boardScore;
+      nextAttackBonus = attackBonusForLines(nextBest.clearedLines, difficulty);
+    }
+
+    const firstAttackBonus = attackBonusForLines(
+      firstPlacement.clearedLines,
+      difficulty,
+    );
+    const totalScore =
+      AI_FIRST_SCORE_WEIGHT * firstPlacement.boardScore +
+      AI_NEXT_SCORE_WEIGHT * nextScore +
+      firstAttackBonus +
+      nextAttackBonus -
+      deadEndPenalty;
+
+    return {
+      targetCol: firstPlacement.targetCol,
+      targetShape: firstPlacement.targetShape,
+      firstScore: firstPlacement.boardScore,
+      nextScore,
+      totalScore,
+    };
+  });
+
+  candidates.sort((a, b) => b.totalScore - a.totalScore);
 
   let chosen: AiCandidate;
   if (Math.random() < difficulty.aiMistakeChance) {
@@ -377,7 +481,10 @@ const buildAiPlan = (
   } else if (Math.random() < difficulty.aiLineChance) {
     chosen = candidates[0];
   } else {
-    const topPool = candidates.slice(0, Math.min(4, candidates.length));
+    const topPool = candidates.slice(
+      0,
+      Math.min(choicePoolSizeForDifficulty(difficulty), candidates.length),
+    );
     chosen = topPool[Math.floor(Math.random() * topPool.length)] ?? candidates[0];
   }
 

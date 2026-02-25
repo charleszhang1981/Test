@@ -3030,7 +3030,7 @@ function HomePageContent() {
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <CardTitle className="text-3xl font-black tracking-tight text-white sm:text-4xl">
-                    RussiaBricks Arena
+                    Crazy Tetris Arena
                   </CardTitle>
                   <CardDescription className="mt-1 text-sm text-slate-300">
                     单机冲榜 + 联网房间对战（Supabase Realtime）
